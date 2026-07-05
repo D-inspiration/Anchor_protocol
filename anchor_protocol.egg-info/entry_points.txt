@@ -1,0 +1,2 @@
+[console_scripts]
+anchor = anchor_protocol.cli:main

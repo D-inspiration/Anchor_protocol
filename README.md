@@ -1,0 +1,359 @@
+# Anchor Protocol
+
+**A zero-trust local governance sidecar for AI-assisted coding.**
+
+Anchor sits between an AI coding agent (Claude, Gemini, GPT, a local Ollama
+model, OpenHands, Openclaw, or a bare shell script) and your codebase. The
+agent never writes a file directly. It reads through Anchor, proposes an
+edit through Anchor, and Anchor validates scope, syntax, semantic
+preconditions, and declared invariants before anything touches disk.
+
+Everything in this repository runs **entirely on your machine**. There is no
+required network dependency, no required third-party package, and no code
+upload of any kind. It was built and is dogfooded on Termux (Android), so it
+has to work with nothing.
+
+```
+pip install anchor-protocol
+anchor init .
+```
+
+---
+
+## Why this exists
+
+AI agents are good at writing code and bad at knowing what they don't know.
+A refactor that looks complete can be silently wrong in ways syntax checkers
+and even test suites miss — a hidden assumption that stops holding, a
+function nobody notices is called from four other modules, a "why did we do
+this" that nobody wrote down.
+
+Anchor's own build process produced a real example of exactly this, which is
+now recorded as incident #1 in this repo's own `.anchor` database:
+
+> **Q query-builder API drift.** `db.py` called `Q.insert(...)` and
+> `Q.select(...)` to persist every file read and every proposed edit. `Q`
+> only ever implemented WHERE-clause building — those methods never
+> existed. The code looked complete, imported cleanly, and passed every unit
+> test, because the unit tests were written against a mocked DB layer. The
+> entire persistence path — every `read_file`, every `propose_edit`, every
+> `execute_ticket` — was unreachable until an end-to-end smoke test caught
+> it with an `AttributeError`.
+
+That is the exact failure mode Anchor is built to catch mechanically instead
+of by accident: something that looks finished, compiles, and only breaks
+the first time real data flows through it.
+
+---
+
+## Method
+
+Anchor is organized in four layers:
+
+**1. Zero-trust mediation (`guardian.py`, `sidecar.py`)**
+Every read and write goes through `Guardian`: path-sandbox checks (can't
+escape the project root or touch `.git`/`.env`/`.ssh`/etc.), scope checks
+(is this file in the declared `active` set, or is it `frozen`?), a
+two-phase commit for writes (`propose_edit` issues a ticket; `execute_ticket`
+re-checks the file hasn't drifted since the proposal, validates syntax, then
+writes and backs up atomically).
+
+**2. Tiered scope + token budgeting (`sidecar.py`, `optimizers/token_guard.py`)**
+Files are auto-classified into `context` (read-only reference, e.g.
+`models.py`), `active` (editable, capped at 5 files at a time), and `frozen`
+(protected, e.g. migrations, `__init__.py`). A daily token budget tracks
+read/edit volume so a runaway agent loop can't quietly re-read the same
+files hundreds of times.
+
+**3. Governance layer (`models/`)**
+This is the part that goes beyond "don't let the AI break the sandbox":
+
+| Module | Answers |
+|---|---|
+| `decisions.py` | Why was this change made, by whom, how confident were they? |
+| `assumptions.py` | What unstated belief is this code relying on, and has it been violated? |
+| `invariants.py` | What must remain true no matter who edits this, and can it be checked mechanically? |
+| `trust.py` | Which agent's edits actually hold up over time? |
+| `blast_radius.py` | If I change this symbol, what else moves? |
+| `simulation.py` | What has historically happened when symbols like this changed? (explicitly heuristic, never a guarantee) |
+| `reachability.py` | Which functions are defined but never called by anything? |
+| `incidents.py` | What broke, why, and how was it caught — as structured data, not a paragraph in a commit message. |
+
+**4. Optional, opt-in telemetry (`telemetry.py`) + agent integrations (`integrations/`)**
+Off by default. See [Telemetry](#telemetry) below.
+
+---
+
+## Quickstart
+
+```bash
+pip install anchor-protocol
+cd your-project
+anchor init .                              # creates .anchor/ with a local SQLite db
+anchor status .
+```
+
+Read and propose an edit through Anchor directly:
+
+```bash
+anchor read . --file app/services.py
+```
+
+```python
+from anchor_protocol import AnchorSidecar, EditProposal
+
+anchor = AnchorSidecar(".")
+anchor.init_session()
+anchor.set_manual_scope(active_files=["app/services.py"])
+
+current = anchor.read_file("app/services.py")
+new_content = current.content.replace("return None", "return {'status': 'unsupported'}")
+
+ticket = anchor.propose_edit(EditProposal(
+    path="app/services.py",
+    old_content=current.content,
+    new_content=new_content,
+    reason="handle unsupported provider explicitly",
+    actor="my-script",
+))
+result = anchor.execute_ticket(ticket)
+```
+
+---
+
+## CLI reference
+
+```
+anchor init <path> [--files "*.py"]        Initialize / resume a session
+anchor status <path>                       Scope + token budget
+anchor report <path>                       Full stability report
+anchor read <path> --file f.py             Guardian-mediated read
+anchor propose <path> --file f.py \
+    --old-file old.txt --new-file new.txt \
+    --reason "..." --actor "..."            Issue an edit ticket (for shell/external agents)
+anchor execute <path> --ticket <id>         Apply a previously issued ticket
+
+anchor decision record/list                 ADR-lite decision records
+anchor assumption add/list/violate          Track and flag hidden beliefs
+anchor invariant declare/list/check         Declare + mechanically check invariants
+anchor trust show/leaderboard               Per-agent compliance scores
+anchor blast-radius --symbol foo            Transitive impact of changing `foo`
+anchor simulate --symbol foo                Heuristic historical break-rate
+anchor replay --symbol foo                  Semantic timeline (decisions + drift + ops)
+anchor reachability <path>                  Find orphaned/never-called code
+anchor incident record/list                 Structured post-mortems
+
+anchor agent providers                      List available LLM providers
+anchor agent set-default <path> <provider>  Persist a default provider for this project
+anchor agent explain-report <path>          Ask the LLM to summarize the stability report
+anchor agent propose-fix <path> --file --instruction   LLM drafts a fix -> ticket (not written yet)
+
+anchor telemetry enable/disable/status/export   Local, opt-in usage data (see below)
+```
+
+Every governance subcommand works standalone — you do not need an AI agent
+in the loop at all to get value from `anchor report`, `anchor invariant
+check`, or `anchor reachability`.
+
+---
+
+## Using AI agents through Anchor
+
+### Any provider, switched with one flag
+
+```bash
+anchor agent providers
+#   gemini     Google Gemini free-tier API (GEMINI_API_KEY)
+#   ollama     Local models via Ollama, e.g. phi4, llama3 (no key, no internet)
+#   openai     Paid OpenAI API key (OPENAI_API_KEY)
+#   anthropic  Paid Anthropic API key (ANTHROPIC_API_KEY)
+
+anchor agent set-default . ollama --model phi4    # persisted in .anchor/agent_config.json
+anchor agent explain-report .                     # uses whatever is set as default
+anchor agent --provider gemini explain-report .   # one-off override, doesn't change the default
+```
+
+Resolution order: explicit `--provider` flag → `ANCHOR_AGENT_PROVIDER` env
+var → saved `.anchor/agent_config.json` → `gemini` (lowest-friction free
+default). This is deliberately a one-line switch: a user already paying for
+OpenAI or Anthropic doesn't need to set up a second free-tier key just to
+try Anchor, and dogfooding against a local Ollama model costs nothing and
+never leaves the machine.
+
+```python
+from anchor_protocol import AnchorSidecar
+from anchor_protocol.integrations.factory import get_agent
+
+anchor = AnchorSidecar(".")
+anchor.init_session()
+agent = get_agent(anchor)                 # resolves per the order above
+agent = get_agent(anchor, provider="openai", model="gpt-4o-mini")  # explicit override
+
+print(agent.explain_report())
+ticket = agent.propose_fix("app/services.py", "Add input validation")
+# review the diff, then, separately:
+anchor.execute_ticket(ticket)
+```
+
+Every provider adapter (`integrations/gemini_agent.py`, `ollama_agent.py`,
+`openai_agent.py`, `anthropic_agent.py`) shares one base class
+(`integrations/base.py`) so the *governance* behavior — Guardian mediation,
+trust-score logging, telemetry event shape — is identical regardless of
+which model is actually generating text. Only the HTTP call differs.
+
+### Framework-agnostic: OpenHands, Openclaw, Cursor, or anything that can run a shell command
+
+You do not need the Python integration classes at all. Any agent that can
+run a shell command, read a file, and parse JSON can drive Anchor directly:
+
+```bash
+anchor propose . --file app/services.py \
+    --old-file /tmp/before.py --new-file /tmp/after.py \
+    --reason "refactor payment handling" --actor openhands --confidence 0.8
+# -> Ticket issued: 7f3a9c1e...
+
+anchor execute . --ticket 7f3a9c1e...
+```
+
+`propose` and `execute` are separate CLI invocations by design — the ticket
+is persisted to the local SQLite db, not held in memory, specifically so an
+agent framework that shells out once per step (propose, wait for a human or
+policy check, then execute) works correctly across process boundaries.
+
+Suggested instruction block to drop into any agent's system prompt:
+
+```
+Anchor Protocol is installed in this project. Before editing any file:
+  anchor blast-radius . --symbol <symbol_you_are_about_to_change>
+  anchor simulate . --symbol <symbol_you_are_about_to_change>
+Submit changes via:
+  anchor propose . --file <path> --old-file <tmp_old> --new-file <tmp_new> --reason "..." --actor <your_name>
+Do not write files directly. After every change:
+  anchor report .
+Explain any contract or invariant violations before continuing.
+```
+
+---
+
+## Telemetry
+
+**Off by default.** Nothing is recorded until you run `anchor telemetry
+enable`, and nothing is ever transmitted anywhere automatically — there is
+no network call anywhere in `telemetry.py`. `anchor telemetry export` writes
+a local JSON file; what you do with that file is entirely up to you.
+
+```bash
+anchor telemetry status .      # enabled: false, events_recorded: 0
+anchor telemetry enable .
+anchor telemetry export . --out my_usage.json
+anchor telemetry disable .
+```
+
+**Collected, when enabled** (all metadata, no code):
+
+```json
+{
+  "agent": "gemini-2.0-flash",
+  "provider": "gemini",
+  "operation": "propose_edit",
+  "contracts_checked": 3,
+  "contracts_failed": 1,
+  "drift_detected": false,
+  "language": "py"
+}
+```
+
+**Never collected, under any configuration** — enforced by a scrub step in
+`telemetry.py` that strips these keys even if a caller accidentally passes
+them: `source_code`, `content`, `file_content`, `secret(s)`, `password`,
+`api_key`, `token`, `env`, `credentials`, `private_key`.
+
+There is currently no cloud endpoint this data is sent to — that is
+intentional. The plan (see project notes) is: finish dogfooding locally,
+accumulate real incidents and exported telemetry from consenting users, and
+only then consider an opt-in aggregation service, publicized with an exact,
+auditable description of what it receives.
+
+---
+
+## Real-world use cases
+
+**Nigerian fintech/CRM stacks with multiple payment providers.** The
+canonical assumption-tracking failure — "there is only one payment
+provider" — breaks the day a second one (Paystack, Flutterwave) gets added
+to code an agent wrote against a single-provider assumption. `anchor
+assumption add --text "only Monnify exists" --symbol process_payment` turns
+that from a silent landmine into a tracked, queryable belief that gets
+flagged the day it's violated.
+
+**Multi-agent workflows where cost matters.** Route cheap/free models
+(a local Ollama phi4, Gemini free tier) at boilerplate and low-risk files,
+and reserve a paid Claude/GPT key for anything `anchor blast-radius` flags
+as `HIGH`/`CRITICAL`. `anchor trust leaderboard` gives you a real,
+project-specific number instead of a vibe for which model to trust with
+which kind of change.
+
+**Any AI coding agent framework (OpenHands, Openclaw, Cursor, Claude Code,
+custom LangGraph/CrewAI agents).** Because the mediation surface is a CLI
+that reads/writes plain files and JSON, none of these need a custom
+integration — point the agent's system prompt at the `anchor propose` /
+`anchor execute` workflow above and every agent gets the same governance
+guarantees without Anchor needing to know anything about the framework.
+
+**Solo developers and small teams.** Even with a single human and no
+"multi-agent" story at all, `anchor invariant declare` + `anchor decision
+record` turns "why did this change six hours/weeks ago" into a one-command
+answer instead of an archaeology project through commit messages.
+
+**Post-incident learning, including Anchor's own.** The three real bugs
+found while building this version — the dead persistence layer, an
+absolute-vs-relative path mismatch in scope checks, and a fully-implemented
+`AnalyticsEngine` that nothing ever called — are recorded as the first three
+`anchor incident` entries in this repo. That is the intended workflow: when
+something breaks, `anchor incident record` it, so the pattern is visible the
+next time something similar starts to happen.
+
+---
+
+## Design constraints (on purpose)
+
+- **Zero required dependencies.** Core Anchor runs on the Python standard
+  library only, so it works unmodified on Termux/Android. `pyyaml` is an
+  optional extra (`pip install anchor-protocol[yaml]`) needed only if you
+  want Anchor to validate `.yaml`/`.yml` edits.
+- **Local-first.** SQLite in `.anchor/`, no server, no account, no code
+  leaves the machine unless you explicitly call a hosted LLM API you
+  configured yourself.
+- **Heuristics are labeled as heuristics.** `simulate_change()` reports a
+  historical base rate from *this project's own data* — it does not predict
+  the future and says so in its own output.
+- **Human-in-the-loop by default.** `propose_fix()` (and the CLI `propose`
+  command) only ever issues a ticket. Nothing is written to disk until a
+  separate, explicit `execute_ticket` / `anchor execute` call.
+
+---
+
+## Packaging / development
+
+```bash
+pip install -e .[dev]
+python -m unittest discover -s anchor_protocol/tests -v
+
+python -m build         # produces dist/*.whl and dist/*.tar.gz
+twine upload dist/*      # publish to PyPI (requires a PyPI account/token)
+```
+
+`setup.py` reads its long description from this README, so PyPI's project
+page will render everything above.
+
+---
+
+## Status
+
+v0.2.0. Core mediation, tiered scope, governance layer (decisions,
+assumptions, invariants, trust, blast radius, simulation, reachability,
+incidents), local opt-in telemetry, and a provider-agnostic agent adapter
+(Gemini, Ollama, OpenAI, Anthropic, plus a pure-CLI path for any other
+framework) are implemented and covered by the test suite
+(`anchor_protocol/tests/`). Contract tests, dependency-graph visualization,
+and a hosted opt-in telemetry aggregator are not yet built.

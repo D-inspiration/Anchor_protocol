@@ -1,0 +1,7 @@
+# Core Anchor Protocol has zero required third-party dependencies --
+# it runs on the standard library alone (this is a deliberate design
+# constraint so it works unmodified on Termux/Android).
+#
+# Optional extras:
+#   pip install anchor-protocol[yaml]   # validate .yaml/.yml file edits
+#   pip install anchor-protocol[dev]    # run the test suite with pytest
