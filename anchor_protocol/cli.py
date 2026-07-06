@@ -130,6 +130,9 @@ def main():
     blast_parser.add_argument('path', help='Project path')
     blast_parser.add_argument('--symbol', required=True)
 
+    scan_deps_parser = subparsers.add_parser('scan-dependencies', help='(Re)build the cross-file dependency graph used by blast-radius')
+    scan_deps_parser.add_argument('path', help='Project path')
+
     replay_parser = subparsers.add_parser('replay', help='Semantic timeline for a symbol/file')
     replay_parser.add_argument('path', help='Project path')
     replay_parser.add_argument('--symbol')
@@ -537,6 +540,13 @@ def main():
             print(f"  Contracts touched: {result['contracts_touched']}")
             print(f"  Historical breaks: {result['historical_breakages']}")
             print(f"  Risk:              {result['risk']}")
+
+    elif args.command == 'scan-dependencies':
+        anchor = AnchorSidecar(project_path)
+        anchor.init_session()
+        anchor.scan_dependencies()
+        count = anchor.db.query('SELECT COUNT(*) as c FROM dependencies')[0]['c']
+        print(f"Dependency graph rebuilt: {count} call relationship(s) recorded.")
 
     elif args.command == 'replay':
         anchor = AnchorSidecar(project_path)

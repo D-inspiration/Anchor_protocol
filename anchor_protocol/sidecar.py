@@ -286,7 +286,7 @@ class AnchorSidecar:
         self.db.log_operation(self.session_id, 'read', rel_path, file_hash)
 
         try:
-            self.registry.extract_symbols(full_path, content)
+            self.registry.extract_symbols(rel_path, content)
         except Exception:
             pass
 
@@ -352,6 +352,11 @@ class AnchorSidecar:
         backup_path = f"{full_path}.anchor.bak"
         shutil.copy2(full_path, backup_path)
 
+        # Capture symbol state BEFORE the write/re-extract below overwrites it in
+        # the registry -- this has to happen here, not after, or "previous" and
+        # "current" would already be identical.
+        previous_symbols = {s['name'] for s in self.registry.get_symbols_for_file(proposal.path)}
+
         try:
             with open(full_path, 'w', encoding='utf-8') as f:
                 f.write(proposal.new_content)
@@ -360,31 +365,74 @@ class AnchorSidecar:
             self.db.log_operation(self.session_id, 'write', proposal.path, new_hash)
             self.token_guard.record_edit(proposal.path, len(proposal.new_content))
 
+            structural_drift = []
             try:
-                self.registry.extract_symbols(full_path, proposal.new_content)
+                new_symbols = self.registry.extract_symbols(proposal.path, proposal.new_content)
+                current_symbols = {s['name'] for s in new_symbols}
+                for missing in previous_symbols - current_symbols:
+                    structural_drift.append({'type': 'missing_symbol', 'symbol': missing})
+                    self.drift_tracker.record_drift(None, 'missing_symbol', severity='high')
+                for added in current_symbols - previous_symbols:
+                    structural_drift.append({'type': 'silent_drift', 'symbol': added})
+                    self.drift_tracker.record_drift(None, 'silent_drift', severity='low')
             except Exception:
                 pass
 
             self.trust.record_operation(proposal.actor, contract_compliant=True,
                                          invariant_compliant=(len(invariant_hits) == 0))
 
-            self.telemetry.record_event('propose_edit', {
+            # Rich telemetry: real evidence, not boilerplate counters that never change.
+            io_contract_results = []
+            for contract in self.io_contracts.list_all_contracts():
+                if contract['file'] != proposal.path:
+                    continue
+                input_drift = self.io_contracts.detect_input_drift(contract['symbol'], proposal.new_content)
+                output_drift = self.io_contracts.detect_output_drift(contract['symbol'], proposal.new_content)
+                io_contract_results.append({
+                    'symbol': contract['symbol'],
+                    'status': self._io_contract_status(input_drift, output_drift),
+                    'input_drift': input_drift,
+                    'output_drift': output_drift,
+                })
+
+            self.telemetry.record_event('edit_executed', {
                 'agent': proposal.actor,
-                'operation': 'propose_edit',
-                'contracts_checked': len(invariant_hits) + 1,
-                'contracts_failed': len(invariant_hits),
-                'drift_detected': False,
+                'path': proposal.path,
                 'language': os.path.splitext(proposal.path)[1].lstrip('.') or 'unknown',
+                'invariant_violations': invariant_hits,       # which invariant, which line -- not just a count
+                'structural_drift': structural_drift,          # missing_symbol/silent_drift + the actual name
+                'io_contracts_checked': len(io_contract_results),
+                'io_contracts_failed': sum(1 for c in io_contract_results if c['status'] == 'FAIL'),
+                'io_contract_results': io_contract_results,    # per-symbol PASS/FAIL with the real expected/actual
             })
 
             self._pending_tickets.pop(ticket_id, None)
             return {
                 'success': True, 'path': proposal.path, 'hash': new_hash,
                 'backup': backup_path, 'invariant_violations': invariant_hits,
+                'structural_drift': structural_drift, 'io_contract_results': io_contract_results,
             }
         except Exception:
             shutil.copy2(backup_path, full_path)
             raise
+
+    @staticmethod
+    def _io_contract_status(input_drift: List[Dict], output_drift: Optional[Dict]) -> str:
+        """
+        MISSING beats everything else -- a deleted/renamed-away symbol is the
+        most severe outcome, not a pass. UNKNOWN means Anchor genuinely
+        couldn't resolve a type and says so, rather than silently reporting
+        'Any' as if it were a confidently-inferred value. FAIL is a real,
+        resolved mismatch. PASS means nothing above fired.
+        """
+        if any(d.get('type') == 'symbol_removed' for d in input_drift) or \
+           (output_drift and output_drift.get('type') == 'symbol_removed'):
+            return 'MISSING'
+        if output_drift and output_drift.get('type') == 'output_type_unknown' and not input_drift:
+            return 'UNKNOWN'
+        if input_drift or output_drift:
+            return 'FAIL'
+        return 'PASS'
 
     @staticmethod
     def _parse_db_timestamp(ts: str) -> float:
@@ -396,12 +444,12 @@ class AnchorSidecar:
     def detect_drift(self, rel_path: str) -> List[Dict[str, Any]]:
         """Compare currently-registered symbols for a file against its current AST."""
         full_path = self._abs_path(rel_path)
-        previous = {s['name'] for s in self.registry.get_symbols_for_file(full_path)}
+        previous = {s['name'] for s in self.registry.get_symbols_for_file(rel_path)}
 
         with open(full_path, 'r', encoding='utf-8') as f:
             content = f.read()
         try:
-            new_symbols = self.registry.extract_symbols(full_path, content)
+            new_symbols = self.registry.extract_symbols(rel_path, content)
         except Exception:
             return []
         current = {s['name'] for s in new_symbols}
@@ -419,6 +467,13 @@ class AnchorSidecar:
 
     def get_stability_report(self):
         return self.analytics.generate_report(self.project_root)
+
+    def scan_dependencies(self) -> None:
+        """Populate the cross-file dependency graph that blast_radius/predict_impact
+        rely on. Not run automatically on every edit (it walks the whole project);
+        call it explicitly after a batch of changes, e.g. at the start of a stress
+        test or before checking blast-radius on a symbol you're about to touch."""
+        self.impact_tracker.scan_dependencies(self.project_root)
 
     def compute_trust_score(self, symbol_name: str) -> float:
         """Symbol trust score (0.0 = unreliable, 1.0 = solid): 1.0 - (drifts*0.05 + repairs*0.15 + impacts*0.25)"""

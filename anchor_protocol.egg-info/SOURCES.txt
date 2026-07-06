@@ -4,7 +4,10 @@ pyproject.toml
 setup.py
 anchor_protocol/__init__.py
 anchor_protocol/cli.py
+anchor_protocol/diagnose_io_contracts.py
 anchor_protocol/guardian.py
+anchor_protocol/phase2_gemini_runner.py
+anchor_protocol/score_benchmark.py
 anchor_protocol/sidecar.py
 anchor_protocol/telemetry.py
 anchor_protocol.egg-info/PKG-INFO

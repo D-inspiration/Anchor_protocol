@@ -281,6 +281,121 @@ class TestGovernanceLayer(unittest.TestCase):
             self.assertIn('unsupported', f.read())
 
 
+    def test_contract_drift_no_false_positive_on_unannotated_unchanged_code(self):
+        """
+        Regression test: detect_input_drift/detect_output_drift used to compare
+        a declared contract's type string against the literal 'Any' whenever a
+        function had no PEP 484 annotations -- which is most real code. That
+        meant declaring ANY contract on unannotated code produced a permanent
+        false-positive drift alert, even with zero actual changes.
+        """
+        self.anchor.set_manual_scope(active_files=['payments.py'])
+        self.anchor.io_contracts.declare_contract(
+            symbol_name='charge_stripe', inputs={'amount': 'int'}, output_type='dict'
+        )
+        with open(self.test_file) as f:
+            unchanged_source = f.read()
+        input_drift = self.anchor.io_contracts.detect_input_drift('charge_stripe', unchanged_source)
+        output_drift = self.anchor.io_contracts.detect_output_drift('charge_stripe', unchanged_source)
+        self.assertEqual(input_drift, [])
+        self.assertIsNone(output_drift)
+
+    def test_contract_drift_detects_real_output_type_change(self):
+        self.anchor.io_contracts.declare_contract(
+            symbol_name='charge_stripe', inputs={'amount': 'int'}, output_type='dict'
+        )
+        changed_source = (
+            "def charge_stripe(amount):\n"
+            "    return [amount, 'ok']\n"
+        )
+        output_drift = self.anchor.io_contracts.detect_output_drift('charge_stripe', changed_source)
+        self.assertIsNotNone(output_drift)
+        self.assertEqual(output_drift['expected'], 'dict')
+        self.assertEqual(output_drift['actual'], 'list')
+
+
+    def test_execute_ticket_detects_io_contract_violation(self):
+        """
+        Regression test: registry.extract_symbols was called with the full
+        ABSOLUTE path in some places and the RELATIVE path elsewhere, so a
+        contract declared via the relative path (as everything else in the
+        system uses) could never be matched up with the file the registry
+        actually recorded -- io_contract_results was silently always empty,
+        with no error, just quietly useless.
+        """
+        self.anchor.set_manual_scope(active_files=['payments.py'])
+        self.anchor.io_contracts.declare_contract(
+            symbol_name='charge_stripe', inputs={'amount': 'int'}, output_type='dict'
+        )
+        with open(self.test_file) as f:
+            old_content = f.read()
+        new_content = old_content.replace(
+            "return {'status': 'ok', 'amount': amount}", "return [amount, 'ok']"
+        ).replace(
+            'return {"status": "ok", "amount": amount}', 'return [amount, "ok"]'
+        )
+        proposal = EditProposal(path='payments.py', old_content=old_content, new_content=new_content,
+                                 reason='break the contract on purpose', actor='test-agent')
+        ticket = self.anchor.propose_edit(proposal)
+        result = self.anchor.execute_ticket(ticket)
+
+        self.assertEqual(len(result['io_contract_results']), 1)
+        self.assertEqual(result['io_contract_results'][0]['symbol'], 'charge_stripe')
+        self.assertEqual(result['io_contract_results'][0]['status'], 'FAIL')
+
+
+    def test_io_contract_status_missing_when_symbol_deleted(self):
+        """
+        Regression test: when the contracted symbol is deleted/inlined away,
+        detect_input_drift/detect_output_drift used to return an empty
+        list/None -- indistinguishable from 'nothing changed'. A deleted
+        symbol reported as PASS is a false negative on the single worst
+        outcome the contract system exists to catch.
+        """
+        self.anchor.set_manual_scope(active_files=['payments.py'])
+        self.anchor.io_contracts.declare_contract(
+            symbol_name='charge_stripe', inputs={'amount': 'int'}, output_type='dict'
+        )
+        with open(self.test_file) as f:
+            old_content = f.read()
+        new_content = (
+            "def process_payment(amount, provider):\n"
+            "    if provider == 'stripe':\n"
+            "        return {'status': 'ok', 'amount': amount}\n"
+            "    return None\n"
+        )
+        proposal = EditProposal(path='payments.py', old_content=old_content, new_content=new_content,
+                                 reason='inline charge_stripe away', actor='test-agent')
+        ticket = self.anchor.propose_edit(proposal)
+        result = self.anchor.execute_ticket(ticket)
+        self.assertEqual(result['io_contract_results'][0]['status'], 'MISSING')
+
+    def test_io_contract_status_unknown_when_type_unresolvable(self):
+        """
+        Regression test: an unresolvable return shape (e.g. a BinOp/f-string)
+        used to silently report actual='Any' and status=FAIL, indistinguishable
+        from a confidently-detected type change. It should report UNKNOWN with
+        actual='unresolved' instead.
+        """
+        self.anchor.set_manual_scope(active_files=['payments.py'])
+        self.anchor.io_contracts.declare_contract(
+            symbol_name='charge_stripe', inputs={'amount': 'int'}, output_type='dict'
+        )
+        with open(self.test_file) as f:
+            old_content = f.read()
+        new_content = old_content.replace(
+            "return {'status': 'ok', 'amount': amount}", 'return "charged " + str(amount)'
+        ).replace(
+            'return {"status": "ok", "amount": amount}', 'return "charged " + str(amount)'
+        )
+        proposal = EditProposal(path='payments.py', old_content=old_content, new_content=new_content,
+                                 reason='unresolvable return type', actor='test-agent')
+        ticket = self.anchor.propose_edit(proposal)
+        result = self.anchor.execute_ticket(ticket)
+        self.assertEqual(result['io_contract_results'][0]['status'], 'UNKNOWN')
+        self.assertEqual(result['io_contract_results'][0]['output_drift']['actual'], 'unresolved')
+
+
 class TestNewGovernanceModules(unittest.TestCase):
     """Incidents, reachability, telemetry, and the multi-provider agent factory."""
 

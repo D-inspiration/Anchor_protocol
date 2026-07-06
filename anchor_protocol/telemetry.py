@@ -88,3 +88,52 @@ class TelemetryManager:
         events = self.db.query('SELECT COUNT(*) as c FROM telemetry_events')[0]['c']
         self.db.execute('DELETE FROM telemetry_events', ())
         return events
+
+    def build_payload(self) -> Dict[str, Any]:
+        """The exact JSON body submit()/export() would send -- exposed separately so
+        callers (and the CLI) can show it to the user before anything leaves the machine."""
+        events = self.db.query('SELECT event_type, payload, created_at FROM telemetry_events ORDER BY created_at')
+        return {
+            'anchor_version': self._get_version(),
+            'events': [
+                {'event_type': e['event_type'], 'payload': json.loads(e['payload']), 'created_at': e['created_at']}
+                for e in events
+            ],
+        }
+
+    @staticmethod
+    def _get_version() -> str:
+        try:
+            from . import __version__
+            return __version__
+        except ImportError:
+            return 'unknown'
+
+    def submit(self, endpoint: str, timeout: int = 15) -> Dict[str, Any]:
+        """
+        POST the current export to `endpoint`. There is no default endpoint --
+        one must always be passed explicitly, so this can never silently phone
+        home. Intended to be called only after the CLI has shown the user the
+        exact payload and asked for confirmation (see `anchor telemetry submit`).
+        """
+        if not self.is_enabled():
+            raise RuntimeError("Telemetry is disabled. Run 'anchor telemetry enable' first.")
+        if not endpoint:
+            raise ValueError("submit() requires an explicit endpoint URL -- there is no default.")
+
+        import urllib.request
+        import urllib.error
+
+        payload = self.build_payload()
+        body = json.dumps(payload).encode('utf-8')
+        req = urllib.request.Request(endpoint, data=body, headers={'Content-Type': 'application/json'}, method='POST')
+        try:
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                status = resp.status
+                response_body = resp.read().decode('utf-8', 'ignore')
+        except urllib.error.HTTPError as e:
+            raise RuntimeError(f"Submit failed with HTTP {e.code}: {e.read().decode('utf-8', 'ignore')}")
+        except urllib.error.URLError as e:
+            raise RuntimeError(f"Could not reach {endpoint}: {e.reason}")
+
+        return {'status': status, 'events_sent': len(payload['events']), 'response': response_body[:500]}

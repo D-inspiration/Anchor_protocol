@@ -1,0 +1,13 @@
+# PLACEHOLDER LABELS -- these are a starting point, not ground truth. Only you
+# can decide what "correct" means for each scenario (e.g. is a clean function
+# split acceptable silent_drift, or should Anchor treat any new symbol as a
+# fail?). Edit expected_structural/expected_io/expected_overall to match your
+# own judgment before trusting the accuracy score this produces.
+id,change_description,category,expected_structural,expected_io,expected_overall
+P2-1,Rename every local variable,safe_rename,PASS,PASS,PASS
+P2-2,Inline charge_stripe into process_payment,safe_inline,FAIL,MISSING,FAIL
+P2-3,Split process_payment into two functions,split_function,FAIL,PASS,FAIL
+P2-4,Delete all comments and docstrings,safe_reorder,PASS,PASS,PASS
+P2-5,Remove input validation from get_user,missing_side_effect,PASS,PASS,PASS
+P2-6,Change charge_stripe return dict to string,return_type_change,PASS,FAIL,FAIL
+P2-7,Reorder statements in process_payment,safe_reorder,PASS,PASS,PASS

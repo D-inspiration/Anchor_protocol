@@ -92,16 +92,16 @@ class AnchorAgent:
         )
         try:
             ticket = self.sidecar.propose_edit(proposal)
-            self._log('propose_edit', {
+            self._log('proposal_issued', {
                 'agent': self.actor_name, 'provider': self.provider_name,
                 'language': os.path.splitext(rel_path)[1].lstrip('.') or 'unknown',
-                'accepted': True,
+                'confidence': proposal.confidence,
+                'ticket': ticket,
             })
             return ticket
         except PermissionError as e:
-            self._log('propose_edit', {
-                'agent': self.actor_name, 'provider': self.provider_name,
-                'accepted': False, 'reason': str(e),
+            self._log('proposal_denied', {
+                'agent': self.actor_name, 'provider': self.provider_name, 'reason': str(e),
             })
             raise
 

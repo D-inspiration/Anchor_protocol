@@ -19,7 +19,7 @@ class SymbolRegistry:
         except SyntaxError:
             return []
         symbols = []
-        file_id = self._get_or_create_file(file_path)
+        file_id = self._get_or_create_file(file_path, content)
         for node in ast.walk(tree):
             if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
                 symbol = self._extract_symbol(node, file_path, content)
@@ -66,9 +66,7 @@ class SymbolRegistry:
                 count += 1
         return count
 
-    def _get_or_create_file(self, path: str) -> int:
-        with open(path, 'r') as f:
-            content = f.read()
+    def _get_or_create_file(self, path: str, content: str) -> int:
         hash_val = hashlib.sha256(content.encode()).hexdigest()[:16]
         result = self.db.query('SELECT id FROM files WHERE path = ?', (path,))
         if result:
