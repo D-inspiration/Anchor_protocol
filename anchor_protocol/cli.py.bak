@@ -5,9 +5,6 @@ import sys
 import argparse
 import glob
 from .sidecar import AnchorSidecar, EditProposal, ROLE_CONTEXT, ROLE_ACTIVE, ROLE_FROZEN
-from . import global_config
-from . import guardian_policy
-from .telemetry import DEFAULT_ENDPOINT
 
 
 def main():
@@ -147,60 +144,15 @@ def main():
     simulate_parser.add_argument('--symbol', required=True)
     simulate_parser.add_argument('--description', default='')
 
-    analyze_parser = subparsers.add_parser('analyze', help='Run Anchor checks against a file as it sits on disk (no ticket needed)')
-    analyze_parser.add_argument('path', help='Project path')
-    analyze_parser.add_argument('--file', required=True, help='File to analyze')
-
-    review_parser = subparsers.add_parser('review', help='Record human review evidence for a file')
-    review_parser.add_argument('path', help='Project path')
-    review_parser.add_argument('--file', required=True, help='File being reviewed')
-    review_parser.add_argument('--reason', default='', help='Why this is trusted (optional but recommended)')
-
-    override_parser = subparsers.add_parser('override', help='Record an explicit bypass (audit trail, not trust)')
-    override_parser.add_argument('path', help='Project path')
-    override_parser.add_argument('--file', required=True)
-    override_parser.add_argument('--reason', default='', help='Why verification was skipped')
-
-    trust_parser = subparsers.add_parser('trust-state', help='Show evidence-based trust state for a file, or all tracked files')
-    trust_parser.add_argument('path', help='Project path')
-    trust_parser.add_argument('--file', help='Specific file (omit to list all tracked files)')
-
-    hook_parser = subparsers.add_parser('install-hook', help='Install the git pre-commit trust hook')
-    hook_parser.add_argument('path', help='Project path')
-    hook_parser.add_argument('--force', action='store_true', help='Overwrite an existing pre-commit hook')
-
-    precommit_parser = subparsers.add_parser('precommit-check', help='(internal) Called by the installed git hook')
-    precommit_parser.add_argument('path', help='Project path')
-    precommit_parser.add_argument('--non-interactive', action='store_true',
-                                   help='Fail closed instead of prompting (for CI)')
-
     telemetry_parser = subparsers.add_parser('telemetry', help='Local, opt-in usage telemetry')
     telemetry_sub = telemetry_parser.add_subparsers(dest='telemetry_cmd')
-
-    telemetry_enable = telemetry_sub.add_parser('enable', help='Turn telemetry on for this project')
-    telemetry_enable.add_argument('path', help='Project path')
-    telemetry_enable.add_argument('--mode', choices=['manual', 'auto_time', 'auto_count'],
-                                   help='Sync mode. If omitted, runs an interactive prompt.')
-    telemetry_enable.add_argument('--yes', action='store_true',
-                                   help='Skip interactive prompts (requires --mode); accepts auto-sync confirmation non-interactively')
-
-    for sub_name, help_text in (('disable', 'Turn telemetry off (default)'), ('status', 'Show telemetry state')):
+    for sub_name, help_text in (('enable', 'Turn telemetry on'), ('disable', 'Turn telemetry off (default)'),
+                                 ('status', 'Show telemetry state')):
         p = telemetry_sub.add_parser(sub_name, help=help_text)
         p.add_argument('path', help='Project path')
-
     telemetry_export = telemetry_sub.add_parser('export', help='Export recorded events to a JSON file')
     telemetry_export.add_argument('path', help='Project path')
     telemetry_export.add_argument('--out', default='anchor_telemetry_export.json')
-
-    telemetry_pending = telemetry_sub.add_parser('pending', help='Show what would be sent by the next sync')
-    telemetry_pending.add_argument('path', help='Project path')
-
-    telemetry_sync = telemetry_sub.add_parser('sync', help='Send unsynced events to the telemetry endpoint')
-    telemetry_sync.add_argument('path', help='Project path')
-    telemetry_sync.add_argument('--dry-run', action='store_true', help='Print the payload and exit without sending anything')
-    telemetry_sync.add_argument('--endpoint', help=f'Override the default endpoint ({DEFAULT_ENDPOINT})')
-    telemetry_sync.add_argument('--yes', action='store_true', help='Skip the confirmation prompt')
-    telemetry_sync.add_argument('--api-key', help='Override ANCHOR_TELEMETRY_API_KEY for this call')
 
     incident_parser = subparsers.add_parser('incident', help='Record/list incident case studies')
     incident_sub = incident_parser.add_subparsers(dest='incident_cmd')
@@ -616,261 +568,24 @@ def main():
             print(f"  Historical project break rate: {result['historical_project_break_rate']}")
             print(f"  Recommendation: {result['recommendation']}")
 
-    elif args.command == 'analyze':
-        anchor = AnchorSidecar(project_path)
-        anchor.init_session()
-        try:
-            result = anchor.analyze_file(args.file)
-        except FileNotFoundError as e:
-            print(f"Failed: {e}")
-            sys.exit(1)
-        if result['passed']:
-            print(f"PASS -- {args.file}")
-            print(f"  Recorded 'anchor_scan' evidence (state now ANCHOR_VERIFIED).")
-        else:
-            print(f"FAIL -- {args.file}: {len(result['violations'])} violation(s)")
-            for v in result['violations']:
-                print(f"  [{v['kind']}] {v['detail']}")
-            sys.exit(1)
-
-    elif args.command == 'review':
-        anchor = AnchorSidecar(project_path)
-        anchor.init_session()
-        try:
-            entry = anchor.mark_reviewed(args.file, reason=args.reason)
-        except FileNotFoundError as e:
-            print(f"Failed: {e}")
-            sys.exit(1)
-        print(f"Recorded human_review for {args.file} (state now HUMAN_REVIEWED).")
-        if args.reason:
-            print(f"  Reason: {args.reason}")
-
-    elif args.command == 'override':
-        anchor = AnchorSidecar(project_path)
-        anchor.init_session()
-        try:
-            entry = anchor.mark_override(args.file, reason=args.reason)
-        except FileNotFoundError as e:
-            print(f"Failed: {e}")
-            sys.exit(1)
-        print(f"Recorded manual_override for {args.file} -- this is an audit trail, "
-              f"not trust; by default it does NOT satisfy the commit policy.")
-        if args.reason:
-            print(f"  Reason: {args.reason}")
-
-    elif args.command == 'trust-state':
-        anchor = AnchorSidecar(project_path)
-        anchor.init_session()
-        if args.file:
-            state = anchor.trust_state(args.file)
-            print(f"{state['path']}: {state['state']}")
-            print(f"  Valid evidence: {state['valid_evidence_types'] or '(none)'}")
-            print(f"  Total evidence recorded (incl. stale): {state['total_evidence_count']}")
-        else:
-            tracked = anchor.file_trust.tracked_files()
-            if not tracked:
-                print("No files have any recorded evidence yet.")
-            for path in tracked:
-                state = anchor.trust_state(path)
-                print(f"  {state['state']:<20} {path}")
-
-    elif args.command == 'install-hook':
-        hook_dir = os.path.join(project_path, '.git', 'hooks')
-        if not os.path.isdir(os.path.join(project_path, '.git')):
-            print(f"Failed: {project_path} is not a git repository (no .git directory).")
-            sys.exit(1)
-        os.makedirs(hook_dir, exist_ok=True)
-        hook_path = os.path.join(hook_dir, 'pre-commit')
-        if os.path.exists(hook_path) and not args.force:
-            print(f"Failed: {hook_path} already exists. Use --force to overwrite.")
-            sys.exit(1)
-        script = (
-            "#!/bin/sh\n"
-            "# Installed by: anchor install-hook\n"
-            f"exec python3 -m anchor_protocol.cli precommit-check {project_path}\n"
-        )
-        with open(hook_path, 'w') as f:
-            f.write(script)
-        os.chmod(hook_path, 0o755)
-        print(f"Installed pre-commit hook at {hook_path}")
-        print("Every `git commit` will now check staged files' trust state first.")
-
-    elif args.command == 'precommit-check':
-        import subprocess
-        anchor = AnchorSidecar(project_path)
-        anchor.init_session()
-        policy = guardian_policy.load(project_path)
-
-        try:
-            staged = subprocess.run(
-                ['git', 'diff', '--cached', '--name-only', '--diff-filter=ACMR'],
-                cwd=project_path, capture_output=True, text=True, check=True
-            ).stdout.splitlines()
-        except subprocess.CalledProcessError as e:
-            print(f"Could not list staged files: {e}")
-            sys.exit(1)
-
-        staged_py = [f for f in staged if f.endswith('.py') and os.path.exists(os.path.join(project_path, f))]
-        if not staged_py:
-            sys.exit(0)  # nothing this hook cares about -- let the commit through
-
-        def _get_prompt_stream():
-            """git frequently disconnects a hook's stdin even when a real
-            terminal exists (sys.stdin.isatty() is unreliable here) -- the
-            standard workaround is to open /dev/tty directly, and only at
-            the point a prompt is actually needed (opening it unconditionally
-            for every commit, including ones that never need to prompt, is
-            itself a bug -- it was here in an earlier version of this hook).
-            Returns None if there's truly no terminal available (CI, etc).
-            """
-            if args.non_interactive:
-                return None
-            try:
-                return open('/dev/tty', 'r')
-            except OSError:
-                return None
-
-        def _prompt(stream, message: str) -> str:
-            print(message, end='', flush=True)
-            line = stream.readline()
-            return line.strip() if line else ''
-
-        for rel_path in staged_py:
-            state = anchor.trust_state(rel_path)
-            if guardian_policy.meets_policy(state['valid_evidence_types'], policy):
-                continue  # already trusted, no prompt needed -- no tty touched at all
-
-            print(f"\n{rel_path} was modified.")
-            print(f"  Current state: {state['state']}  (policy requires "
-                  f"{policy['minimum_evidence']} of {policy['accepted']})")
-
-            tty = _get_prompt_stream()
-            if tty is None:
-                print("  No interactive terminal available -- failing closed. "
-                      "Run with a real terminal, or use `anchor analyze`/`anchor review` "
-                      "beforehand so the commit already meets policy.")
-                sys.exit(1)
-
-            choice = _prompt(tty, "  [1] Run Anchor analysis now  [2] Mark as human-reviewed  [3] Abort commit > ")
-            if choice == '1':
-                result = anchor.analyze_file(rel_path)
-                if not result['passed']:
-                    print(f"  Anchor analysis FAILED ({len(result['violations'])} violation(s)) -- commit blocked.")
-                    for v in result['violations']:
-                        print(f"    [{v['kind']}] {v['detail']}")
-                    tty.close()
-                    sys.exit(1)
-                print("  Anchor analysis passed.")
-            elif choice == '2':
-                reason = _prompt(tty, "  Reason (optional): ")
-                anchor.mark_reviewed(rel_path, reason=reason)
-                print("  Recorded as human-reviewed.")
-            else:
-                print("  Commit aborted.")
-                tty.close()
-                sys.exit(1)
-            tty.close()
-
-            # Re-check: the evidence just recorded must actually satisfy policy
-            # (e.g. a project that only accepts anchor_scan would still block
-            # here after a human_review-only choice -- this isn't a rubber stamp).
-            state = anchor.trust_state(rel_path)
-            if not guardian_policy.meets_policy(state['valid_evidence_types'], policy):
-                print(f"  {rel_path} still doesn't meet policy after that -- commit blocked.")
-                sys.exit(1)
-
-        sys.exit(0)
-
     elif args.command == 'telemetry':
         anchor = AnchorSidecar(project_path)
         anchor.init_session()
-
         if args.telemetry_cmd == 'enable':
             anchor.telemetry.enable()
-
-            mode = args.mode
-            if mode is None and not args.yes:
-                print("Enable anonymous telemetry? Nothing is sent anywhere until you "
-                      "run 'anchor telemetry sync' yourself, unless you pick an auto mode below.")
-                choice = input("Sync mode: [1] Manual (default)  [2] Every N hours  [3] Every N events > ").strip()
-                mode = {'1': 'manual', '2': 'auto_time', '3': 'auto_count'}.get(choice, 'manual')
-            elif mode is None:
-                mode = 'manual'
-
-            fields = {'mode': mode}
-            if mode in ('auto_time', 'auto_count'):
-                if not args.yes:
-                    print(f"Auto-sync will periodically send data to {DEFAULT_ENDPOINT} "
-                          "without asking each time (still only metadata -- see docs/telemetry.md).")
-                    confirm = input("Confirm auto-sync? [y/N] ").strip().lower()
-                    confirmed = confirm == 'y'
-                else:
-                    confirmed = True
-                fields['auto_sync_confirmed'] = confirmed
-                if not confirmed:
-                    fields['mode'] = 'manual'
-                    print("Not confirmed -- falling back to manual mode. Run 'anchor telemetry sync' yourself whenever you like.")
-            global_config.update_telemetry(**fields)
-
-            print("Telemetry enabled. Nothing is sent anywhere automatically in manual mode -- use "
-                  "'anchor telemetry pending' to see what's queued and 'anchor telemetry sync --dry-run' "
-                  "to see exactly what would be sent, on your terms.")
-
+            print("Telemetry enabled. Nothing is sent anywhere automatically -- use "
+                  "'anchor telemetry export' to see exactly what's stored, on your terms.")
         elif args.telemetry_cmd == 'disable':
             anchor.telemetry.disable()
             print("Telemetry disabled (this is also the default for new projects).")
-
         elif args.telemetry_cmd == 'status':
             status = anchor.telemetry.status()
-            gcfg = global_config.load()['telemetry']
             print(f"Telemetry: {'ENABLED' if status['enabled'] else 'disabled'}")
             print(f"  Events recorded locally: {status['events_recorded']}")
-            print(f"  Events pending sync:     {status['events_pending']}")
-            print(f"  Sync mode:               {gcfg['mode']}")
-            print(f"  Config:                  {status['config_path']}")
-
-        elif args.telemetry_cmd == 'pending':
-            summary = anchor.telemetry.pending_summary()
-            gcfg = global_config.load()['telemetry']
-            print(f"Telemetry enabled: {'Yes' if summary['enabled'] else 'No'}")
-            print(f"Queued events: {summary['pending_events']}")
-            last_sync = gcfg.get('last_sync_unix', 0)
-            if last_sync:
-                import time as _time
-                days = (_time.time() - last_sync) / 86400
-                print(f"Last sync: {days:.1f} day(s) ago")
-            else:
-                print("Last sync: never")
-            print(f"Estimated upload: {summary['estimated_upload_bytes']} bytes")
-
+            print(f"  Config: {status['config_path']}")
         elif args.telemetry_cmd == 'export':
             n = anchor.telemetry.export(args.out)
             print(f"Exported {n} events to {args.out}")
-
-        elif args.telemetry_cmd == 'sync':
-            endpoint = args.endpoint or global_config.load()['telemetry'].get('endpoint_override') or DEFAULT_ENDPOINT
-            payload = anchor.telemetry.build_payload(unsynced_only=True)
-            if args.dry_run:
-                import json as _json
-                print(_json.dumps(payload, indent=2))
-                print(f"\n(dry run -- {len(payload['events'])} event(s) shown, nothing sent, endpoint would be {endpoint})")
-            elif not payload['events']:
-                print("Nothing pending -- no sync needed.")
-            else:
-                if not args.yes:
-                    print(f"About to send {len(payload['events'])} event(s) to {endpoint}.")
-                    confirm = input("Proceed? [y/N] ").strip().lower()
-                    if confirm != 'y':
-                        print("Cancelled.")
-                        return
-                try:
-                    result = anchor.telemetry.submit(endpoint, api_key=args.api_key)
-                    print(f"Sent {result['events_sent']} event(s) -- HTTP {result['status']}")
-                    import time as _time
-                    global_config.update_telemetry(last_sync_unix=_time.time())
-                except (RuntimeError, ValueError) as e:
-                    print(f"Sync failed: {e}")
-                    sys.exit(1)
 
     elif args.command == 'incident':
         anchor = AnchorSidecar(project_path)
@@ -958,35 +673,6 @@ def main():
         except (ValueError, PermissionError) as e:
             print(f"Failed: {e}")
             sys.exit(1)
-
-    _maybe_auto_sync(args, project_path)
-
-
-def _maybe_auto_sync(args, project_path: str) -> None:
-    """Best-effort background sync check, run after any command completes.
-
-    Deliberately silent and non-fatal: this must never be the reason a
-    command fails or prints something the user didn't ask for, beyond the
-    one line it prints when it actually sends something. Skipped entirely
-    for the 'telemetry' command itself, since that already handles syncing
-    explicitly (and to avoid a sync-inside-a-sync-check surprise).
-    """
-    if getattr(args, 'command', None) in (None, 'telemetry'):
-        return
-    try:
-        anchor = AnchorSidecar(project_path)
-        gcfg = global_config.load()['telemetry']
-        if not anchor.telemetry.should_auto_sync(gcfg):
-            return
-        endpoint = gcfg.get('endpoint_override') or DEFAULT_ENDPOINT
-        result = anchor.telemetry.submit(endpoint)
-        import time as _time
-        global_config.update_telemetry(last_sync_unix=_time.time())
-        if result['events_sent']:
-            print(f"[anchor telemetry] auto-synced {result['events_sent']} event(s) to {endpoint}")
-    except Exception:
-        # Never let a background sync attempt break or confuse the command the user actually ran.
-        pass
 
 
 if __name__ == '__main__':

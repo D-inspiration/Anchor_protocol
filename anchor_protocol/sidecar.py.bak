@@ -28,7 +28,6 @@ from .models.incidents import IncidentManager
 from .models.reachability import ReachabilityAnalyzer
 from .telemetry import TelemetryManager
 from .guardian import Guardian
-from .models.file_trust import FileTrustManager
 
 
 # Context window budgeting constants
@@ -152,7 +151,7 @@ class AnchorSidecar:
     def __init__(self, project_root: str):
         self.project_root = os.path.abspath(project_root)
         self.db = Database(self.project_root)
-        self.token_guard = TokenGuard(db=self.db)
+        self.token_guard = TokenGuard()
         self.registry = Registry(self.db)
         self.io_contracts = IOContractManager(self.db)
         self.execution_traces = ExecutionTraceManager(self.db)
@@ -166,7 +165,6 @@ class AnchorSidecar:
         self.assumptions = AssumptionManager(self.db)
         self.invariants = InvariantManager(self.db)
         self.trust = AgentTrustManager(self.db)
-        self.file_trust = FileTrustManager(self.db, self.project_root)
         self.blast_radius = BlastRadiusAnalyzer(self.db)
         self.simulation = SimulationEngine(self.db, self.blast_radius)
         self.incidents = IncidentManager(self.db)
@@ -293,78 +291,6 @@ class AnchorSidecar:
             pass
 
         return FileReadResult(path=rel_path, content=content, hash=file_hash)
-
-    def analyze_file(self, rel_path: str) -> Dict[str, Any]:
-        """Run Anchor's mechanical checks against a file AS IT CURRENTLY
-        SITS ON DISK -- no ticket, no proposal, no prior read_file() call
-        required. This is deliberately separate from propose_edit/
-        execute_ticket: a human editing a file directly (or fixing a typo,
-        reverting, spiking an idea -- see the file_trust module docstring
-        for why origin isn't what's being tracked) has no "proposal" to
-        submit, just a file that needs checking.
-
-        On a clean result, records 'anchor_scan' evidence in file_trust
-        stamped with the file's current content hash. On failure, records
-        nothing -- a failed scan is not evidence the file can be trusted.
-        Also re-indexes the file's symbols into the registry either way, so
-        blast-radius/reachability stay accurate for hand-edited files too.
-        """
-        full_path = self._abs_path(rel_path)
-        if not os.path.exists(full_path):
-            raise FileNotFoundError(f"'{rel_path}' does not exist")
-        with open(full_path, 'r', encoding='utf-8') as f:
-            content = f.read()
-
-        violations = []
-
-        syntax_ok, syntax_error = self.guardian.validate_syntax(content, rel_path)
-        if not syntax_ok:
-            violations.append({'kind': 'syntax', 'detail': syntax_error})
-
-        if syntax_ok:
-            try:
-                invariant_hits = self.invariants.check_source(rel_path, content)
-            except Exception as e:
-                invariant_hits = []
-                violations.append({'kind': 'invariant_check_error', 'detail': str(e)})
-            # check_source() returns violations directly (not a pass/fail list) --
-            # every entry present here IS a violation.
-            for hit in invariant_hits:
-                violations.append({'kind': 'invariant', 'detail': hit})
-
-            try:
-                self.registry.extract_symbols(rel_path, content)
-            except Exception:
-                pass
-
-        passed = len(violations) == 0
-        evidence = None
-        if passed:
-            evidence = self.file_trust.record_evidence(
-                rel_path, 'anchor_scan',
-                detail='syntax OK, 0 invariant violation(s)',
-                actor='anchor_analyze',
-            )
-
-        return {'path': rel_path, 'passed': passed, 'violations': violations, 'evidence': evidence}
-
-    def mark_reviewed(self, rel_path: str, reason: str = '', actor: str = 'human') -> Dict[str, Any]:
-        """Record that a human looked at the current on-disk version of a
-        file and vouches for it -- no analysis performed, this is trust by
-        assertion, not by mechanism. Distinct evidence type from
-        'anchor_scan' so `anchor trust-state` and policy config can tell
-        them apart."""
-        return self.file_trust.record_evidence(rel_path, 'human_review', detail=reason, actor=actor)
-
-    def mark_override(self, rel_path: str, reason: str = '', actor: str = 'human') -> Dict[str, Any]:
-        """Record an explicit bypass -- NOT trust, an audit trail of someone
-        choosing to skip verification. Deliberately excluded from
-        guardian_policy.DEFAULT_POLICY's accepted list; a project has to
-        opt in to letting 'manual_override' satisfy the commit policy."""
-        return self.file_trust.record_evidence(rel_path, 'manual_override', detail=reason, actor=actor)
-
-    def trust_state(self, rel_path: str) -> Dict[str, Any]:
-        return self.file_trust.get_state(rel_path)
 
     def propose_edit(self, proposal: EditProposal) -> str:
         """Validate scope + budget for a proposed edit and issue a ticket."""
